@@ -1,3 +1,5 @@
+![Engine Preview](preview.png)
+
 ### Dependencies
 * C++17 compiler (GCC / MinGW-w64)
 * SDL2
