@@ -1,5 +1,7 @@
 #pragma once
 
+// class written by claude
+
 #include <GL/glew.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
