@@ -1,17 +1,22 @@
 #pragma once
+#include <algorithm>
 #include <vector>
-#include <GL/gl.h>
+#include <GL/glew.h>
 #include <btBulletDynamicsCommon.h>
-#include "math.h"
-#include "lighting.h"
+#include "vec3.h"
+#include "consts.h"
+#include "geometry.h"
+#include "materials.h"
 
 struct Box {
     btRigidBody* body = nullptr;
     btCollisionShape* shape = nullptr;
     Vec3 halfSize;
-    Vec3 color;
-    Vec3 spawnPos;
-    float mass = 1.0f;
+    Vec3 color = Vec3(1.0f, 1.0f, 1.0f);
+    float mass = 0.0f;
+    bool isStatic = false;
+    btTransform spawn;
+    Material* material = nullptr;
 };
 
 class GameWorld {
@@ -22,12 +27,12 @@ public:
     btSequentialImpulseConstraintSolver* solver = nullptr;
     btDiscreteDynamicsWorld* dynamicsWorld = nullptr;
 
-    btRigidBody* platformBody = nullptr;
-    btCollisionShape* platformShape = nullptr;
-    const float platformHalfSize = 10.0f;
-    const float platformThickness = 1.2f;
-
     std::vector<Box> boxes;
+    std::vector<Box> statics;
+
+    float respawnY = consts::DEFAULT_RESPAWN_Y;
+    Vec3 playerSpawnPos = consts::PLAYER_SPAWN_POS;
+    float playerSpawnYaw = 0.0f;
 
     void init() {
         collisionConfig = new btDefaultCollisionConfiguration();
@@ -35,211 +40,132 @@ public:
         broadphase      = new btDbvtBroadphase();
         solver          = new btSequentialImpulseConstraintSolver();
         dynamicsWorld   = new btDiscreteDynamicsWorld(dispatcher, broadphase, solver, collisionConfig);
-        dynamicsWorld->setGravity(btVector3(0.0f, -18.0f, 0.0f));
-
-        createPlatform();
-        createBoxes();
+        dynamicsWorld->setGravity(btVector3(0.0f, consts::GRAVITY_Y, 0.0f));
     }
 
-    void resetBox(Box& b) {
-        btTransform trans;
-        trans.setIdentity();
-        trans.setOrigin(btVector3(b.spawnPos.x, b.spawnPos.y, b.spawnPos.z));
-        b.body->setWorldTransform(trans);
-        b.body->getMotionState()->setWorldTransform(trans);
-        b.body->setLinearVelocity(btVector3(0, 0, 0));
-        b.body->setAngularVelocity(btVector3(0, 0, 0));
-        b.body->activate(true);
+    void stepPhysics(float dt) {
+        dynamicsWorld->stepSimulation(dt, consts::PHYSICS_MAX_SUBSTEPS, consts::PHYSICS_STEP);
+    }
+
+    void addObject(bool dynamic, const Vec3& pos, const Vec3& rotDeg, const Vec3& size, Material* material) {
+        using namespace consts;
+        constexpr float kDegToRad = 3.14159265f / 180.0f;
+
+        Box b;
+        b.isStatic = !dynamic;
+        b.halfSize = Vec3(std::max(size.x, 0.01f) * 0.5f, std::max(size.y, 0.01f) * 0.5f, std::max(size.z, 0.01f) * 0.5f);
+        b.material = material;
+        b.color = material ? Vec3(1.0f, 1.0f, 1.0f) : DEFAULT_OBJECT_COLOR;
+
+        btQuaternion rot;
+        rot.setEuler(rotDeg.y * kDegToRad, rotDeg.x * kDegToRad, rotDeg.z * kDegToRad);
+        b.spawn.setIdentity();
+        b.spawn.setOrigin(btVector3(pos.x, pos.y, pos.z));
+        b.spawn.setRotation(rot);
+
+        b.shape = new btBoxShape(btVector3(b.halfSize.x, b.halfSize.y, b.halfSize.z));
+        btVector3 inertia(0, 0, 0);
+        if (dynamic) {
+            b.mass = (b.halfSize.x * 2.0f) * (b.halfSize.y * 2.0f) * (b.halfSize.z * 2.0f) * BOX_DENSITY;
+            b.shape->calculateLocalInertia(b.mass, inertia);
+        }
+
+        auto* motion = new btDefaultMotionState(b.spawn);
+        btRigidBody::btRigidBodyConstructionInfo ci(b.mass, motion, b.shape, inertia);
+        if (dynamic) {
+            ci.m_friction = BOX_FRICTION;
+            ci.m_restitution = BOX_RESTITUTION;
+            ci.m_rollingFriction = BOX_ROLLING_FRICTION;
+            ci.m_spinningFriction = BOX_SPINNING_FRICTION;
+        } else {
+            ci.m_friction = STATIC_FRICTION;
+            ci.m_restitution = STATIC_RESTITUTION;
+        }
+
+        b.body = new btRigidBody(ci);
+        if (dynamic) {
+            b.body->setDamping(BOX_LINEAR_DAMPING, BOX_ANGULAR_DAMPING);
+            b.body->setUserIndex(static_cast<int>(boxes.size()));
+        }
+        dynamicsWorld->addRigidBody(b.body);
+        (dynamic ? boxes : statics).push_back(b);
+    }
+
+    void clearLevel() {
+        auto destroy = [this](std::vector<Box>& list) {
+            for (auto& b : list) {
+                dynamicsWorld->removeRigidBody(b.body);
+                delete b.body->getMotionState();
+                delete b.body;
+                delete b.shape;
+            }
+            list.clear();
+        };
+        destroy(boxes);
+        destroy(statics);
+
+        respawnY = consts::DEFAULT_RESPAWN_Y;
+        playerSpawnPos = consts::PLAYER_SPAWN_POS;
+        playerSpawnYaw = 0.0f;
+    }
+
+    template <typename OnRespawn>
+    void respawnFallenBoxes(OnRespawn&& onRespawn) {
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            btTransform t;
+            boxes[i].body->getMotionState()->getWorldTransform(t);
+            if (t.getOrigin().y() < respawnY) {
+                onRespawn(static_cast<int>(i));
+                resetBox(boxes[i]);
+            }
+        }
     }
 
     void resetAllBoxes() {
         for (auto& b : boxes) resetBox(b);
     }
 
-    void stepPhysics(float dt, int& heldBoxIndex, btRigidBody* playerBody) {
-        dynamicsWorld->stepSimulation(dt, 10, 1.0f / 120.0f);
-
-        for (size_t i = 0; i < boxes.size(); ++i) {
-            btTransform t;
-            boxes[i].body->getMotionState()->getWorldTransform(t);
-            if (t.getOrigin().y() < -30.0f) {
-                if (static_cast<int>(i) == heldBoxIndex) {
-                    boxes[i].body->setIgnoreCollisionCheck(playerBody, false);
-                    playerBody->setIgnoreCollisionCheck(boxes[i].body, false);
-                    heldBoxIndex = -1;
-                }
-                resetBox(boxes[i]);
-            }
-        }
-    }
-
-    void renderDepth() const {
-        glDisable(GL_STENCIL_TEST);
-        drawPlatformTop();
-        drawPlatformSides();
-        for (const auto& b : boxes) {
-            drawBox(b, false);
-        }
-    }
-
-    void render(const LightingSystem& lighting) const {
-        // (void)lighting; // клод сказал закомментировать - я ему верю
-        glDisable(GL_STENCIL_TEST);
-        drawPlatformTop();
-        drawPlatformSides();
-        for (const auto& b : boxes) {
-            drawBox(b, false);
-        }
+    void render() const {
+        for (const auto& s : statics) drawBox(s);
+        for (const auto& b : boxes) drawBox(b);
     }
 
     void cleanup() {
-        for (auto& b : boxes) {
-            dynamicsWorld->removeRigidBody(b.body);
-            delete b.body->getMotionState();
-            delete b.body;
-            delete b.shape;
-        }
-        dynamicsWorld->removeRigidBody(platformBody);
-        delete platformBody->getMotionState();
-        delete platformBody;
-        delete platformShape;
-
+        clearLevel();
         delete dynamicsWorld;
         delete solver;
         delete broadphase;
         delete dispatcher;
         delete collisionConfig;
+        dynamicsWorld = nullptr;
     }
 
 private:
-    void createPlatform() {
-        platformShape = new btBoxShape(btVector3(platformHalfSize, platformThickness * 0.5f, platformHalfSize));
-        btTransform trans;
-        trans.setIdentity();
-        trans.setOrigin(btVector3(0.0f, -platformThickness * 0.5f, 0.0f));
-        auto* motion = new btDefaultMotionState(trans);
-        btRigidBody::btRigidBodyConstructionInfo ci(0.0f, motion, platformShape, btVector3(0, 0, 0));
-        ci.m_friction = 0.90f;
-        ci.m_restitution = 0.05f;
-        platformBody = new btRigidBody(ci);
-        dynamicsWorld->addRigidBody(platformBody);
+    static void resetBox(Box& b) {
+        b.body->setWorldTransform(b.spawn);
+        b.body->getMotionState()->setWorldTransform(b.spawn);
+        b.body->setLinearVelocity(btVector3(0, 0, 0));
+        b.body->setAngularVelocity(btVector3(0, 0, 0));
+        b.body->clearForces();
+        b.body->activate(true);
     }
 
-    void createBoxes() {
-        struct BoxPreset { Vec3 pos; Vec3 halfSize; Vec3 color; };
-        std::vector<BoxPreset> presets = {
-            {{-2.0f, 0.5f, -1.5f},  {0.50f, 0.50f, 0.50f}, {0.72f, 0.48f, 0.24f}},
-            {{-1.42f, 1.55f, -1.5f},{0.45f, 0.45f, 0.45f}, {0.76f, 0.52f, 0.28f}},
-            {{ 1.5f, 0.5f, -2.0f},  {0.50f, 0.50f, 0.50f}, {0.68f, 0.44f, 0.22f}},
-            {{ 0.0f, 0.3f,  0.8f},  {0.30f, 0.30f, 0.30f}, {0.82f, 0.68f, 0.22f}},
-            {{-0.8f, 0.35f, 0.8f},  {0.35f, 0.35f, 0.35f}, {0.26f, 0.52f, 0.74f}},
-            {{ 3.2f, 0.85f, -3.5f}, {0.85f, 0.85f, 0.85f}, {0.72f, 0.24f, 0.24f}},
-            {{-3.8f, 0.6f, -3.5f},  {0.60f, 0.60f, 0.60f}, {0.28f, 0.62f, 0.38f}},
-            {{ 0.5f, 0.4f, -4.0f},  {0.40f, 0.40f, 0.40f}, {0.58f, 0.36f, 0.68f}}
-        };
-
-        const float density = 22.0f;
-        for (const auto& p : presets) {
-            Box b;
-            b.halfSize = p.halfSize;
-            b.color = p.color;
-            b.spawnPos = p.pos;
-
-            float volume = (p.halfSize.x * 2.0f) * (p.halfSize.y * 2.0f) * (p.halfSize.z * 2.0f);
-            b.mass = volume * density;
-
-            b.shape = new btBoxShape(btVector3(p.halfSize.x, p.halfSize.y, p.halfSize.z));
-            btTransform trans;
-            trans.setIdentity();
-            trans.setOrigin(btVector3(p.pos.x, p.pos.y, p.pos.z));
-
-            btVector3 inertia(0, 0, 0);
-            b.shape->calculateLocalInertia(b.mass, inertia);
-
-            auto* motion = new btDefaultMotionState(trans);
-            btRigidBody::btRigidBodyConstructionInfo rbInfo(b.mass, motion, b.shape, inertia);
-            rbInfo.m_friction = 0.88f;
-            rbInfo.m_restitution = 0.08f;
-            rbInfo.m_rollingFriction = 0.14f;
-            rbInfo.m_spinningFriction = 0.14f;
-
-            b.body = new btRigidBody(rbInfo);
-            b.body->setDamping(0.25f, 0.38f);
-            b.body->setUserIndex(static_cast<int>(boxes.size()));
-            dynamicsWorld->addRigidBody(b.body);
-
-            boxes.push_back(b);
-        }
-    }
-
-    static void renderUnitCube() {
-        glBegin(GL_QUADS);
-        glNormal3f(0, 1, 0);
-        glVertex3f(-1, 1, -1); glVertex3f(-1, 1, 1); glVertex3f(1, 1, 1); glVertex3f(1, 1, -1);
-        glNormal3f(0, -1, 0);
-        glVertex3f(-1, -1, -1); glVertex3f(1, -1, -1); glVertex3f(1, -1, 1); glVertex3f(-1, -1, 1);
-        glNormal3f(0, 0, 1);
-        glVertex3f(-1, -1, 1); glVertex3f(1, -1, 1); glVertex3f(1, 1, 1); glVertex3f(-1, 1, 1);
-        glNormal3f(0, 0, -1);
-        glVertex3f(-1, -1, -1); glVertex3f(-1, 1, -1); glVertex3f(1, 1, -1); glVertex3f(1, -1, -1);
-        glNormal3f(1, 0, 0);
-        glVertex3f(1, -1, -1); glVertex3f(1, 1, -1); glVertex3f(1, 1, 1); glVertex3f(1, -1, 1);
-        glNormal3f(-1, 0, 0);
-        glVertex3f(-1, -1, -1); glVertex3f(-1, -1, 1); glVertex3f(-1, 1, 1); glVertex3f(-1, 1, -1);
-        glEnd();
-    }
-
-    static void drawBox(const Box& b, bool shadowPass) {
+    static void drawBox(const Box& b) {
         btTransform trans;
         b.body->getMotionState()->getWorldTransform(trans);
         float glMat[16];
         trans.getOpenGLMatrix(glMat);
 
+        Materials::Bind(b.material);
+
         glPushMatrix();
         glMultMatrixf(glMat);
         glScalef(b.halfSize.x, b.halfSize.y, b.halfSize.z);
+        glColor3f(b.color.x, b.color.y, b.color.z);
 
-        if (!shadowPass) {
-            glColor3f(b.color.x, b.color.y, b.color.z);
-        }
+        if (b.isStatic)  	drawUnitCube(b.halfSize.x * 2.0f, b.halfSize.y * 2.0f, b.halfSize.z * 2.0f);
+        else 				drawUnitCube();
 
-        renderUnitCube();
         glPopMatrix();
-    }
-
-    void drawPlatformTop() const {
-        int grid = static_cast<int>(platformHalfSize);
-        glBegin(GL_QUADS);
-        glNormal3f(0.0f, 1.0f, 0.0f);
-        for (int x = -grid; x < grid; ++x) {
-            for (int z = -grid; z < grid; ++z) {
-                if (((x + z) & 1) != 0) glColor3f(0.42f, 0.45f, 0.49f);
-                else      glColor3f(0.55f, 0.58f, 0.62f);
-
-                glVertex3f(x, 0.0f, z);
-                glVertex3f(x, 0.0f, z + 1.0f);
-                glVertex3f(x + 1.0f, 0.0f, z + 1.0f);
-                glVertex3f(x + 1.0f, 0.0f, z);
-            }
-        }
-        glEnd();
-    }
-
-    void drawPlatformSides() const {
-        float s = platformHalfSize;
-        float b = -platformThickness;
-        glColor3f(0.34f, 0.38f, 0.42f);
-        glBegin(GL_QUADS);
-        glNormal3f(0, 0, 1);
-        glVertex3f(-s, b, s); glVertex3f(s, b, s); glVertex3f(s, 0, s); glVertex3f(-s, 0, s);
-        glNormal3f(0, 0, -1);
-        glVertex3f(s, b, -s); glVertex3f(-s, b, -s); glVertex3f(-s, 0, -s); glVertex3f(s, 0, -s);
-        glNormal3f(1, 0, 0);
-        glVertex3f(s, b, s); glVertex3f(s, b, -s); glVertex3f(s, 0, -s); glVertex3f(s, 0, s);
-        glNormal3f(-1, 0, 0);
-        glVertex3f(-s, b, -s); glVertex3f(-s, b, s); glVertex3f(-s, 0, s); glVertex3f(-s, 0, -s);
-        glNormal3f(0, -1, 0);
-        glVertex3f(-s, b, -s); glVertex3f(s, b, -s); glVertex3f(s, b, s); glVertex3f(-s, b, s);
-        glEnd();
     }
 };

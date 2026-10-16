@@ -1,7 +1,5 @@
 #pragma once
 
-// class written by claude
-
 #include <GL/glew.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -55,9 +53,7 @@ public:
         glLoadIdentity();
 
         glUseProgram(0);
-        glDisable(GL_LIGHTING);
         glDisable(GL_DEPTH_TEST);
-        glDisable(GL_CULL_FACE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_TEXTURE_2D);

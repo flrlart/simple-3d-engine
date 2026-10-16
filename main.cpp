@@ -2,143 +2,166 @@
 #include <SDL2/SDL.h>
 #include <GL/glu.h>
 
-#include "math.h"
-#include "lighting.h"
+#include "vec3.h"
+#include "consts.h"
+#include "sky.h"
 #include "world.h"
 #include "controller.h"
 #include "shadows.h"
 #include "font.h"
 #include "hud.h"
+#include "textures.h"
+#include "materials.h"
+#include "level.h"
 
 int main(int argc, char* argv[]) {
-    SDL_Init(SDL_INIT_VIDEO);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_Window* window = nullptr;
+    SDL_GLContext glContext = nullptr;
+    TextHUD hud;
+    ShadowMapping shadows;
+
+    auto fail = [&](const char* message) {
+        SDL_Log("%s", message);
+        hud.cleanup();
+        shadows.cleanup();
+        Materials::DestroyAll();
+        Textures::UnloadAll();
+        if (glContext) SDL_GL_DeleteContext(glContext);
+        if (window) SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    };
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        return fail(SDL_GetError());
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, consts::GL_CONTEXT_MAJOR);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, consts::GL_CONTEXT_MINOR);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, consts::DEPTH_BUFFER_BITS);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-    int winWidth = 1280, winHeight = 720;
-    SDL_Window* window = SDL_CreateWindow(
-        "boxtest", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+    int winWidth = consts::WINDOW_WIDTH, winHeight = consts::WINDOW_HEIGHT;
+    window = SDL_CreateWindow(
+        consts::WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         winWidth, winHeight,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
     );
-
     if (!window) {
         SDL_Log("create window failed: %s", SDL_GetError());
-        SDL_Quit();
-        return 1;
+        return fail("window creation failed");
     }
 
-    SDL_GLContext glContext = SDL_GL_CreateContext(window);
+    glContext = SDL_GL_CreateContext(window);
     if (!glContext) {
         SDL_Log("context failed: %s", SDL_GetError());
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
+        return fail("opengl context creation failed");
     }
 
     glewExperimental = GL_TRUE;
     const GLenum glewStatus = glewInit();
     if (glewStatus != GLEW_OK) {
         SDL_Log("glew init failed: %s", glewGetErrorString(glewStatus));
-        SDL_GL_DeleteContext(glContext);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
+        return fail("glew initialization failed");
     }
     while (glGetError() != GL_NO_ERROR) {}
 
-    SDL_GL_SetSwapInterval(1);
+    SDL_GL_SetSwapInterval(consts::VSYNC_ENABLED ? 1 : 0);
     SDL_SetRelativeMouseMode(SDL_TRUE);
     glEnable(GL_DEPTH_TEST);
-    
-    TextHUD hud;
-    if (!hud.init(hud_font_data, hud_font_data_len, 20)) {
-        SDL_Log("hud init failed");
-        SDL_GL_DeleteContext(glContext);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
+
+    if (!hud.init(hud_font_data, hud_font_data_len, consts::HUD_FONT_PIXEL_HEIGHT)) {
+        return fail("hud init failed");
+    }
+    if (!shadows.init(consts::SHADOW_MAP_SIZE)) {
+        return fail("dynamic shadow init failed");
     }
 
-    LightingSystem lighting;
-    lighting.init();
-
-    ShadowMapping shadows;
-    if (!shadows.init(4096)) {
-        SDL_Log("dynamic shadow init failed");
-        shadows.cleanup();
-        SDL_GL_DeleteContext(glContext);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
-
+    Sky sky;
     GameWorld world;
     world.init();
 
     PlayerController player;
     player.init(world.dynamicsWorld);
 
+    std::string currentLevel = (argc > 1) ? argv[1] : consts::DEFAULT_LEVEL; // либо аргументом, либо из consts
+    auto loadLevel = [&](const std::string& path) {
+        player.releaseHeldBox(world);
+        if (!Level::Load(world, path.c_str())) return false;
+        currentLevel = path;
+        player.teleportToSpawn(world);
+        return true;
+    };
+    if (!loadLevel(currentLevel)) return fail("level load failed");
+
+    const Uint64 perfFreq = SDL_GetPerformanceFrequency();
     Uint64 prevCounter = SDL_GetPerformanceCounter();
     bool running = true;
 
     while (running) {
-        Uint64 now = SDL_GetPerformanceCounter();
-        float dt = static_cast<float>(now - prevCounter) / SDL_GetPerformanceFrequency();
-        prevCounter = now;
-        if (dt > 0.1f) dt = 0.1f;
+        const Uint64 frameStart = SDL_GetPerformanceCounter();
+        float dt = static_cast<float>(frameStart - prevCounter) / static_cast<float>(perfFreq);
+        prevCounter = frameStart;
+        dt = std::min(dt, consts::MAX_FRAME_DT);
 
-        // events
+        // события
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) running = false;
-            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_RESIZED) {
+            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 winWidth = event.window.data1;
                 winHeight = event.window.data2;
+            }
+            if (event.type == SDL_KEYDOWN && !event.key.repeat && event.key.keysym.sym == SDLK_F5) {
+                loadLevel(currentLevel);
+                continue;
             }
             player.handleEvent(event, world, running);
         }
 
-        // update physics
+        // физика
         player.update(world);
-        world.stepPhysics(dt, player.heldBoxIndex, player.body);
+        world.stepPhysics(dt);
+        world.respawnFallenBoxes([&](int boxIndex) {
+            if (boxIndex == player.heldBoxIndex) player.releaseHeldBox(world);
+        });
 
-        // shadows
-        shadows.beginDepthPass(lighting.sunDir);
-        world.renderDepth();
-        shadows.endDepthPass();
+        // каскадные карты теней (считаются от камеры)
+        ShadowCamera shadowCam;
+        shadowCam.pos = player.getEyePos();
+        shadowCam.forward = player.getForward();
+        shadowCam.right = player.getRight();
+        shadowCam.fovY = static_cast<float>(consts::CAMERA_FOV_DEG) * 3.14159265f / 180.0f;
+        shadowCam.aspect = static_cast<float>(winWidth) / static_cast<float>(std::max(winHeight, 1));
+        shadows.update(shadowCam, consts::SUN_DIR);
+        for (int cascade = 0; cascade < ShadowMapping::kCascades; ++cascade) {
+            shadows.beginDepthPass(cascade);
+            world.render();
+            shadows.endDepthPass();
+        }
 
-        // camera pass
+        // карта
         player.setupCamera(winWidth, winHeight);
-        lighting.drawSkyboxAndSun(player.getEyePos());
-        lighting.applyLights();
-
-        shadows.beginScene(lighting.sunDir);
-        world.render(lighting);
+        sky.draw(player.getEyePos());
+        shadows.beginScene(consts::SUN_DIR);
+        world.render();
         shadows.endScene();
-        
-        hud.drawText(
-            16.0f, 14.0f,
-            "wasd - move\nspace - jump\nleft shift - run\ne - take cube\ne+mouse left - drop cube\nmouse scroll - change hold distance",
-            winWidth, winHeight,
-            1.0f, 1.0f, 1.0f,
-            1.0f
-        );
 
+        // hud
+        hud.drawText(consts::HUD_MARGIN_X, consts::HUD_MARGIN_Y, consts::HUD_HELP_TEXT,
+                     winWidth, winHeight,
+                     consts::HUD_TEXT_COLOR.x, consts::HUD_TEXT_COLOR.y, consts::HUD_TEXT_COLOR.z,
+                     consts::HUD_TEXT_SCALE);
         player.drawCrosshair(winWidth, winHeight);
+
         SDL_GL_SwapWindow(window);
-        
-        static Uint64 lastFrame = SDL_GetPerformanceCounter();
 
-        Uint64 now_ = SDL_GetPerformanceCounter();
-        double elapsed = static_cast<double>(now_ - lastFrame) / SDL_GetPerformanceFrequency();
-        lastFrame = now_;
-
-        if (elapsed < 1.0 / 240.0) {
-            SDL_Delay(1);
+        if (!consts::VSYNC_ENABLED && consts::FPS_LIMIT > 0) {
+            const double frameTime = static_cast<double>(SDL_GetPerformanceCounter() - frameStart) / static_cast<double>(perfFreq);
+            const double targetTime = 1.0 / consts::FPS_LIMIT;
+            if (frameTime < targetTime) {
+                SDL_Delay(static_cast<Uint32>((targetTime - frameTime) * 1000.0));
+            }
         }
     }
 
@@ -146,7 +169,8 @@ int main(int argc, char* argv[]) {
     player.cleanup(world.dynamicsWorld);
     world.cleanup();
     shadows.cleanup();
-
+    Materials::DestroyAll();
+    Textures::UnloadAll();
     SDL_GL_DeleteContext(glContext);
     SDL_DestroyWindow(window);
     SDL_Quit();

@@ -1,10 +1,11 @@
 #pragma once
 #include <SDL2/SDL.h>
-#include <GL/gl.h>
+#include <GL/glew.h>
 #include <GL/glu.h>
 #include <btBulletDynamicsCommon.h>
-#include "Math.h"
-#include "World.h"
+#include "vec3.h"
+#include "consts.h"
+#include "world.h"
 
 class PlayerController {
 public:
@@ -12,27 +13,24 @@ public:
     btCollisionShape* shape = nullptr;
 
     float yaw = 0.0f;
-    float pitch = 10.0f;
-    const float radius = 0.38f;
-    const float cylinderHeight = 1.0f;
-    const float playerMass = 75.0f;
+    float pitch = consts::INITIAL_PITCH;
 
     int heldBoxIndex = -1;
     int hoveredBoxIndex = -1;
-    float holdDistance = 2.4f;
-    const float maxPickupDist = 4.2f;
+    float holdDistance = consts::HOLD_DIST_DEFAULT;
 
     void init(btDiscreteDynamicsWorld* dynamicsWorld) {
-        shape = new btCapsuleShape(radius, cylinderHeight);
+        using namespace consts;
+        shape = new btCapsuleShape(PLAYER_RADIUS, PLAYER_CYLINDER_HEIGHT);
         btTransform trans;
         trans.setIdentity();
-        trans.setOrigin(btVector3(0.0f, 2.0f, 6.5f));
+        trans.setOrigin(btVector3(PLAYER_SPAWN_POS.x, PLAYER_SPAWN_POS.y, PLAYER_SPAWN_POS.z));
 
         auto* motion = new btDefaultMotionState(trans);
         btVector3 inertia(0, 0, 0);
-        shape->calculateLocalInertia(playerMass, inertia);
+        shape->calculateLocalInertia(PLAYER_MASS, inertia);
 
-        btRigidBody::btRigidBodyConstructionInfo ci(playerMass, motion, shape, inertia);
+        btRigidBody::btRigidBodyConstructionInfo ci(PLAYER_MASS, motion, shape, inertia);
         ci.m_friction = 0.0f;
         ci.m_restitution = 0.0f;
 
@@ -45,13 +43,13 @@ public:
     Vec3 getEyePos() const {
         btTransform trans;
         body->getMotionState()->getWorldTransform(trans);
-        btVector3 p = trans.getOrigin();
-        return {p.x(), p.y() + 0.72f, p.z()};
+        const btVector3 p = trans.getOrigin();
+        return {p.x(), p.y() + consts::PLAYER_EYE_OFFSET, p.z()};
     }
 
     Vec3 getForward() const {
-        float ry = yaw * 3.14159265f / 180.0f;
-        float rp = pitch * 3.14159265f / 180.0f;
+        const float ry = yaw * DEG_TO_RAD;
+        const float rp = pitch * DEG_TO_RAD;
         return {
             std::sin(ry) * std::cos(rp),
             -std::sin(rp),
@@ -60,180 +58,108 @@ public:
     }
 
     Vec3 getForwardFlat() const {
-        float ry = yaw * 3.14159265f / 180.0f;
+        const float ry = yaw * DEG_TO_RAD;
         return {std::sin(ry), 0.0f, -std::cos(ry)};
     }
 
     Vec3 getRight() const {
-        float ry = yaw * 3.14159265f / 180.0f;
+        const float ry = yaw * DEG_TO_RAD;
         return {std::cos(ry), 0.0f, std::sin(ry)};
     }
 
-    void releaseHeldBox(GameWorld& world) {
-        if (heldBoxIndex != -1) {
-            world.boxes[heldBoxIndex].body->setIgnoreCollisionCheck(body, false);
-            body->setIgnoreCollisionCheck(world.boxes[heldBoxIndex].body, false);
-            heldBoxIndex = -1;
-        }
+    void teleportToSpawn(const GameWorld& world) {
+        using namespace consts;
+        const float centerOffset = PLAYER_CYLINDER_HEIGHT * 0.5f + PLAYER_RADIUS;
+        btTransform t;
+        t.setIdentity();
+        t.setOrigin(btVector3(world.playerSpawnPos.x, world.playerSpawnPos.y + centerOffset, world.playerSpawnPos.z));
+        body->setWorldTransform(t);
+        body->getMotionState()->setWorldTransform(t);
+        body->setLinearVelocity(btVector3(0, 0, 0));
+        body->clearForces();
+        yaw = world.playerSpawnYaw;
+        pitch = INITIAL_PITCH;
     }
 
-    bool isGrounded(btDiscreteDynamicsWorld* dynamicsWorld) const {
+    void releaseHeldBox(GameWorld& world) {
+        if (heldBoxIndex == -1) return;
+        btRigidBody* box = world.boxes[heldBoxIndex].body;
+        box->setIgnoreCollisionCheck(body, false);
+        body->setIgnoreCollisionCheck(box, false);
+        heldBoxIndex = -1;
+    }
+
+    bool isGrounded(const GameWorld& world) const {
+        using namespace consts;
         btTransform trans;
         body->getMotionState()->getWorldTransform(trans);
-        btVector3 orig = trans.getOrigin();
-        btVector3 rayTo = orig - btVector3(0.0f, cylinderHeight * 0.5f + radius + 0.15f, 0.0f);
-        btCollisionWorld::ClosestRayResultCallback rayCallback(orig, rayTo);
-        dynamicsWorld->rayTest(orig, rayTo, rayCallback);
-        return rayCallback.hasHit();
+        const btVector3 from = trans.getOrigin();
+        const btVector3 to = from - btVector3(0.0f, PLAYER_CYLINDER_HEIGHT * 0.5f + PLAYER_RADIUS + GROUND_CHECK_MARGIN, 0.0f);
+
+        RayIgnoringCallback ray(from, to, body, heldBody(world));
+        world.dynamicsWorld->rayTest(from, to, ray);
+        return ray.hasHit();
     }
 
     void handleEvent(const SDL_Event& event, GameWorld& world, bool& running) {
+        using namespace consts;
+
         if (event.type == SDL_MOUSEMOTION) {
-            const float sensitivity = 0.15f;
-            yaw += event.motion.xrel * sensitivity;
-            pitch += event.motion.yrel * sensitivity;
-            pitch = std::clamp(pitch, -89.0f, 89.0f);
+            yaw += event.motion.xrel * MOUSE_SENSITIVITY;
+            pitch += event.motion.yrel * MOUSE_SENSITIVITY;
+            pitch = std::clamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
         }
 
         if (event.type == SDL_KEYDOWN && !event.key.repeat) {
-            if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
-
-            if (event.key.keysym.sym == SDLK_e) {
-                if (heldBoxIndex != -1) {
-                    releaseHeldBox(world);
-                } else if (hoveredBoxIndex != -1) {
-                    heldBoxIndex = hoveredBoxIndex;
-                    world.boxes[heldBoxIndex].body->activate(true);
-                    world.boxes[heldBoxIndex].body->setIgnoreCollisionCheck(body, true);
-                    body->setIgnoreCollisionCheck(world.boxes[heldBoxIndex].body, true);
-                }
-            }
-
-            if (event.key.keysym.sym == SDLK_r) {
+            switch (event.key.keysym.sym) {
+            case SDLK_ESCAPE:
+                running = false;
+                break;
+            case SDLK_e:
+                if (heldBoxIndex != -1) releaseHeldBox(world);
+                else if (hoveredBoxIndex != -1) grabBox(world, hoveredBoxIndex);
+                break;
+            case SDLK_r:
                 releaseHeldBox(world);
                 world.resetAllBoxes();
-            }
-
-            if (event.key.keysym.sym == SDLK_SPACE && isGrounded(world.dynamicsWorld)) {
-                btVector3 v = body->getLinearVelocity();
-                body->setLinearVelocity(btVector3(v.x(), 6.8f, v.z()));
+                break;
+            case SDLK_SPACE:
+                if (isGrounded(world)) {
+                    const btVector3 v = body->getLinearVelocity();
+                    body->setLinearVelocity(btVector3(v.x(), JUMP_SPEED, v.z()));
+                }
+                break;
+            default:
+                break;
             }
         }
 
-        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-            if (heldBoxIndex != -1) {
-                Box& b = world.boxes[heldBoxIndex];
-                Vec3 dir = getForward();
-                releaseHeldBox(world);
-
-                const float refMass = 22.0f;
-                float effectiveMass = std::max(b.mass, 6.0f);
-                float massScale = std::pow(refMass / effectiveMass, 0.32f);
-                massScale = std::clamp(massScale, 0.45f, 1.25f);
-
-                float throwSpeed = 12.0f * massScale;
-
-                b.body->activate(true);
-                btVector3 currentVel = b.body->getLinearVelocity();
-                b.body->setLinearVelocity(currentVel * 0.25f + btVector3(dir.x, dir.y, dir.z) * throwSpeed);
-            }
+        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT && heldBoxIndex != -1) {
+            throwHeldBox(world);
         }
 
         if (event.type == SDL_MOUSEWHEEL && heldBoxIndex != -1) {
-            holdDistance = std::clamp(holdDistance + event.wheel.y * 0.3f, 1.6f, 4.0f);
+            holdDistance = std::clamp(holdDistance + event.wheel.y * HOLD_DIST_WHEEL_STEP, HOLD_DIST_MIN, HOLD_DIST_MAX);
         }
     }
 
     void update(GameWorld& world) {
-        const Uint8* keys = SDL_GetKeyboardState(nullptr);
-        Vec3 moveDir = {0, 0, 0};
-        Vec3 fwd = getForwardFlat();
-        Vec3 right = getRight();
-
-        if (keys[SDL_SCANCODE_W]) moveDir += fwd;
-        if (keys[SDL_SCANCODE_S]) moveDir -= fwd;
-        if (keys[SDL_SCANCODE_D]) moveDir += right;
-        if (keys[SDL_SCANCODE_A]) moveDir -= right;
-
-        if (moveDir.length() > 0.0f) moveDir = moveDir.normalized();
-
-        bool grounded = isGrounded(world.dynamicsWorld);
-        float maxSpeed = keys[SDL_SCANCODE_LSHIFT] ? 7.8f : 5.0f;
-
-        btVector3 curVel = body->getLinearVelocity();
-        Vec3 desiredVel = moveDir * maxSpeed;
-        btVector3 velDiff(desiredVel.x - curVel.x(), 0.0f, desiredVel.z - curVel.z());
-
-        float accelGain = grounded ? 25.0f : 8.0f;
-        float maxPushForce = keys[SDL_SCANCODE_LSHIFT] ? 1800.0f : 1400.0f;
-
-        btVector3 moveForce = velDiff * (playerMass * accelGain);
-        if (moveForce.length() > maxPushForce) {
-            moveForce = moveForce.normalized() * maxPushForce * 10; // TODO: убрать " * 10", заменить на переменную acceleration
-        }
-        body->applyCentralForce(moveForce);
-
-        btTransform pTrans;
-        body->getMotionState()->getWorldTransform(pTrans);
-        if (pTrans.getOrigin().y() < -25.0f) {
-            releaseHeldBox(world);
-            btTransform resetT;
-            resetT.setIdentity();
-            resetT.setOrigin(btVector3(0.0f, 3.0f, 6.0f));
-            body->setWorldTransform(resetT);
-            body->getMotionState()->setWorldTransform(resetT);
-            body->setLinearVelocity(btVector3(0, 0, 0));
-        }
-
-        if (heldBoxIndex != -1) {
-            Box& b = world.boxes[heldBoxIndex];
-            b.body->activate(true);
-
-            btTransform boxTrans;
-            b.body->getMotionState()->getWorldTransform(boxTrans);
-            btVector3 bPos = boxTrans.getOrigin();
-
-            Vec3 eye = getEyePos();
-            Vec3 target = eye + getForward() * holdDistance;
-            btVector3 toTarget(target.x - bPos.x(), target.y - bPos.y(), target.z - bPos.z());
-
-            float massFactor = std::clamp(std::pow(20.0f / std::max(b.mass, 5.0f), 0.30f), 0.40f, 1.0f);
-            b.body->setLinearVelocity(toTarget * (14.0f * massFactor));
-            b.body->setAngularVelocity(b.body->getAngularVelocity() * 0.82f);
-
-            if (toTarget.length() > 4.5f) {
-                releaseHeldBox(world);
-            }
-        }
-
-        hoveredBoxIndex = -1;
-        if (heldBoxIndex == -1) {
-            Vec3 eye = getEyePos();
-            Vec3 look = getForward();
-            btVector3 rayFrom(eye.x, eye.y, eye.z);
-            btVector3 rayTo = rayFrom + btVector3(look.x, look.y, look.z) * maxPickupDist;
-
-            btCollisionWorld::ClosestRayResultCallback rayCallback(rayFrom, rayTo);
-            world.dynamicsWorld->rayTest(rayFrom, rayTo, rayCallback);
-
-            if (rayCallback.hasHit()) {
-                int idx = rayCallback.m_collisionObject->getUserIndex();
-                if (idx >= 0 && idx < static_cast<int>(world.boxes.size())) {
-                    hoveredBoxIndex = idx;
-                }
-            }
-        }
+        applyMovement(world);
+        respawnIfFallen(world);
+        updateHeldBox(world);
+        updateHover(world);
     }
 
     void setupCamera(int winWidth, int winHeight) const {
+        using namespace consts;
         glViewport(0, 0, winWidth, winHeight);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        gluPerspective(75.0, static_cast<double>(winWidth) / winHeight, 0.1, 150.0);
+        gluPerspective(CAMERA_FOV_DEG, static_cast<double>(winWidth) / winHeight, CAMERA_NEAR_PLANE, CAMERA_FAR_PLANE);
 
-        Vec3 eyePos = getEyePos();
+        const Vec3 eyePos = getEyePos();
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
         glRotatef(pitch, 1.0f, 0.0f, 0.0f);
@@ -242,7 +168,7 @@ public:
     }
 
     void drawCrosshair(int width, int height) const {
-        glDisable(GL_LIGHTING);
+        using namespace consts;
         glDisable(GL_DEPTH_TEST);
 
         glMatrixMode(GL_PROJECTION);
@@ -254,17 +180,19 @@ public:
         glPushMatrix();
         glLoadIdentity();
 
-        int cx = width / 2;
-        int cy = height / 2;
+        const int cx = width / 2;
+        const int cy = height / 2;
+        const int h = CROSSHAIR_HALF_LENGTH;
 
-        if (heldBoxIndex != -1)         glColor3f(1.0f, 0.6f, 0.0f);
-        else if (hoveredBoxIndex != -1) glColor3f(0.2f, 1.0f, 0.3f);
-        else                            glColor3f(0.90f, 0.90f, 0.90f);
+        const Vec3& c = (heldBoxIndex != -1)    ? CROSSHAIR_COLOR_HOLDING
+                      : (hoveredBoxIndex != -1) ? CROSSHAIR_COLOR_HOVER
+                                                : CROSSHAIR_COLOR_IDLE;
+        glColor3f(c.x, c.y, c.z);
 
-        glLineWidth(2.0f);
+        glLineWidth(CROSSHAIR_LINE_WIDTH);
         glBegin(GL_LINES);
-        glVertex2i(cx - 4, cy); glVertex2i(cx + 4, cy);
-        glVertex2i(cx, cy - 4); glVertex2i(cx, cy + 4);
+        glVertex2i(cx - h, cy); glVertex2i(cx + h, cy);
+        glVertex2i(cx, cy - h); glVertex2i(cx, cy + h);
         glEnd();
 
         glPopMatrix();
@@ -273,7 +201,6 @@ public:
         glMatrixMode(GL_MODELVIEW);
 
         glEnable(GL_DEPTH_TEST);
-        glEnable(GL_LIGHTING);
     }
 
     void cleanup(btDiscreteDynamicsWorld* dynamicsWorld) {
@@ -281,5 +208,126 @@ public:
         delete body->getMotionState();
         delete body;
         delete shape;
+    }
+
+private:
+    struct RayIgnoringCallback : btCollisionWorld::ClosestRayResultCallback {
+        const btCollisionObject* ignoreA;
+        const btCollisionObject* ignoreB;
+
+        RayIgnoringCallback(const btVector3& from, const btVector3& to,
+                            const btCollisionObject* a, const btCollisionObject* b = nullptr)
+            : ClosestRayResultCallback(from, to), ignoreA(a), ignoreB(b) {}
+
+        bool needsCollision(btBroadphaseProxy* proxy) const override {
+            const void* obj = proxy->m_clientObject;
+            if (obj == ignoreA || (ignoreB && obj == ignoreB)) return false;
+            return ClosestRayResultCallback::needsCollision(proxy);
+        }
+    };
+
+    const btCollisionObject* heldBody(const GameWorld& world) const {
+        return heldBoxIndex != -1 ? world.boxes[heldBoxIndex].body : nullptr;
+    }
+
+    void grabBox(GameWorld& world, int index) {
+        heldBoxIndex = index;
+        btRigidBody* box = world.boxes[index].body;
+        box->activate(true);
+        box->setIgnoreCollisionCheck(body, true);
+        body->setIgnoreCollisionCheck(box, true);
+    }
+
+    void throwHeldBox(GameWorld& world) {
+        using namespace consts;
+        Box& b = world.boxes[heldBoxIndex];
+        const Vec3 dir = getForward();
+        releaseHeldBox(world);
+
+        const float effectiveMass = std::max(b.mass, THROW_MIN_MASS);
+        const float massScale = std::clamp(std::pow(THROW_REF_MASS / effectiveMass, THROW_MASS_EXPONENT),
+                                           THROW_SCALE_MIN, THROW_SCALE_MAX);
+
+        b.body->activate(true);
+        const btVector3 currentVel = b.body->getLinearVelocity();
+        b.body->setLinearVelocity(currentVel * THROW_KEEP_VELOCITY +
+                                  btVector3(dir.x, dir.y, dir.z) * (THROW_SPEED * massScale));
+    }
+
+    void applyMovement(const GameWorld& world) {
+        using namespace consts;
+        const Uint8* keys = SDL_GetKeyboardState(nullptr);
+
+        Vec3 moveDir = {0, 0, 0};
+        const Vec3 fwd = getForwardFlat();
+        const Vec3 right = getRight();
+        if (keys[SDL_SCANCODE_W]) moveDir += fwd;
+        if (keys[SDL_SCANCODE_S]) moveDir -= fwd;
+        if (keys[SDL_SCANCODE_D]) moveDir += right;
+        if (keys[SDL_SCANCODE_A]) moveDir -= right;
+        moveDir = moveDir.normalized();
+
+        const bool grounded = isGrounded(world);
+        const float maxSpeed = keys[SDL_SCANCODE_LSHIFT] ? RUN_SPEED : WALK_SPEED;
+        const float gain = grounded ? GROUND_ACCEL_GAIN : AIR_ACCEL_GAIN;
+        const float maxAccel = grounded ? GROUND_MAX_ACCEL : AIR_MAX_ACCEL;
+
+        const btVector3 curVel = body->getLinearVelocity();
+        const Vec3 desiredVel = moveDir * maxSpeed;
+
+        btVector3 accel(desiredVel.x - curVel.x(), 0.0f, desiredVel.z - curVel.z());
+        accel *= gain;
+        if (accel.length() > maxAccel) accel = accel.normalized() * maxAccel;
+
+        body->applyCentralForce(accel * PLAYER_MASS);
+    }
+
+    void respawnIfFallen(GameWorld& world) {
+        btTransform t;
+        body->getMotionState()->getWorldTransform(t);
+        if (t.getOrigin().y() >= world.respawnY) return;
+
+        releaseHeldBox(world);
+        teleportToSpawn(world);
+    }
+
+    void updateHeldBox(GameWorld& world) {
+        using namespace consts;
+        if (heldBoxIndex == -1) return;
+
+        Box& b = world.boxes[heldBoxIndex];
+        b.body->activate(true);
+
+        btTransform boxTrans;
+        b.body->getMotionState()->getWorldTransform(boxTrans);
+        const btVector3 bPos = boxTrans.getOrigin();
+
+        const Vec3 target = getEyePos() + getForward() * holdDistance;
+        const btVector3 toTarget(target.x - bPos.x(), target.y - bPos.y(), target.z - bPos.z());
+
+        const float massFactor = std::clamp(std::pow(HOLD_REF_MASS / std::max(b.mass, HOLD_MIN_MASS), HOLD_MASS_EXPONENT),
+                                            HOLD_FACTOR_MIN, HOLD_FACTOR_MAX);
+        b.body->setLinearVelocity(toTarget * (HOLD_GAIN * massFactor));
+        b.body->setAngularVelocity(b.body->getAngularVelocity() * HOLD_ANGULAR_DAMPING);
+
+        if (toTarget.length() > HOLD_MAX_LAG) releaseHeldBox(world);
+    }
+
+    void updateHover(const GameWorld& world) {
+        hoveredBoxIndex = -1;
+        if (heldBoxIndex != -1) return;
+
+        const Vec3 eye = getEyePos();
+        const Vec3 look = getForward();
+        const btVector3 from(eye.x, eye.y, eye.z);
+        const btVector3 to = from + btVector3(look.x, look.y, look.z) * consts::MAX_PICKUP_DIST;
+
+        RayIgnoringCallback ray(from, to, body);
+        world.dynamicsWorld->rayTest(from, to, ray);
+
+        if (ray.hasHit()) {
+            const int idx = ray.m_collisionObject->getUserIndex();
+            if (idx >= 0 && idx < static_cast<int>(world.boxes.size())) hoveredBoxIndex = idx;
+        }
     }
 };
